@@ -1,0 +1,83 @@
+name: Publish validated Windows demo
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: Existing evaluation release ID
+        required: true
+        type: string
+      patch_id:
+        description: Temporary transfer asset ID
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_ID: ${{ inputs.release_id }}
+      PATCH_ID: ${{ inputs.patch_id }}
+    steps:
+      - name: Reconstruct and verify the unchanged installer
+        shell: python {0}
+        run: |
+          import hashlib, http.client, io, json, os, urllib.error, urllib.parse, urllib.request, zipfile
+          expected = '451794e8c44f137a4156ec4cb96181260e641ae1b5e004e0538ded91ce55678d'
+          filename = 'HakimiPro-Demo-0.11.0.exe'
+          repo = os.environ['GITHUB_REPOSITORY']
+          release_id, patch_id = os.environ['RELEASE_ID'], os.environ['PATCH_ID']
+          assert release_id.isdigit() and patch_id.isdigit()
+          headers = {'Authorization': 'Bearer '+os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'User-Agent': 'Hakimi-demo-distribution', 'X-GitHub-Api-Version': '2022-11-28'}
+          def api(method, suffix, data=None):
+              request = urllib.request.Request('https://api.github.com/repos/'+repo+suffix, data=None if data is None else json.dumps(data).encode(), headers={**headers, 'Content-Type':'application/json'}, method=method)
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return None if response.status == 204 else json.load(response)
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args): return None
+          request = urllib.request.Request('https://api.github.com/repos/'+repo+'/releases/assets/'+patch_id, headers={**headers, 'Accept':'application/octet-stream'})
+          try:
+              response = urllib.request.build_opener(NoRedirect).open(request, timeout=60)
+          except urllib.error.HTTPError as error:
+              if error.code != 302: raise
+              location = error.headers['Location']
+              assert urllib.parse.urlsplit(location).hostname in ('release-assets.githubusercontent.com','objects.githubusercontent.com')
+              response = urllib.request.urlopen(urllib.request.Request(location, headers={'User-Agent':'Hakimi-demo-distribution'}), timeout=60)
+          with response: patch = response.read(32*1024*1024+1)
+          assert len(patch) <= 32*1024*1024
+          with zipfile.ZipFile(io.BytesIO(patch)) as archive:
+              manifest = json.loads(archive.read('manifest.json'))
+              literal = archive.read('literal.bin')
+          assert manifest['target_sha256'] == expected and manifest['target_size'] == 132377576
+          with urllib.request.urlopen('https://go.microsoft.com/fwlink/?linkid=2088631', timeout=120) as response:
+              base = response.read(150000000)
+          assert hashlib.sha256(base).hexdigest() == manifest['base_sha256'] == '0a3a390c47e639d0f7fc65b21195fee6b7f65b066f80f70c60fab191d14b7e40'
+          output = io.BytesIO()
+          for kind, offset, length in manifest['operations']:
+              assert kind in ('copy','literal') and offset >= 0 and length > 0
+              source = base if kind == 'copy' else literal
+              assert offset+length <= len(source) and output.tell()+length <= 132377576
+              output.write(source[offset:offset+length])
+          installer = output.getvalue()
+          assert len(installer) == 132377576 and hashlib.sha256(installer).hexdigest() == expected
+          release = api('GET', '/releases/'+release_id)
+          existing = next((item for item in release['assets'] if item['name'] == filename), None)
+          if existing:
+              assert existing['state'] == 'uploaded' and existing['size'] == len(installer) and existing.get('digest') == 'sha256:'+expected
+              asset = existing
+          else:
+              url = urllib.parse.urlsplit(release['upload_url'].split('{',1)[0]+'?name='+filename)
+              assert url.hostname == 'uploads.github.com'
+              connection = http.client.HTTPSConnection(url.hostname, timeout=180, blocksize=1024*1024)
+              connection.request('POST', url.path+'?'+url.query, body=io.BytesIO(installer), headers={**headers,'Content-Type':'application/octet-stream','Content-Length':str(len(installer))})
+              response = connection.getresponse()
+              assert response.status == 201, 'Installer upload failed: '+str(response.status)
+              asset = json.loads(response.read())
+              connection.close()
+          assert asset['state'] == 'uploaded' and asset['size'] == len(installer)
+          if asset.get('digest'): assert asset['digest'] == 'sha256:'+expected
+          api('DELETE', '/releases/assets/'+patch_id)
+          if release['draft']: api('PATCH', '/releases/'+release_id, {'draft':False})
+          print(json.dumps({'download':asset['browser_download_url'],'bytes':asset['size'],'sha256':expected,'application_source_uploaded':False,'private_signing_keys_uploaded':False}))
